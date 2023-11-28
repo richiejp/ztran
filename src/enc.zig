@@ -1,10 +1,12 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const BytePairError = error{
     NonAsciiInput,
     IndxTooBig,
     TruncatedSymbol,
+    CorpusTooBig,
 };
 
 fn isAscii(c: u8) bool {
@@ -50,6 +52,18 @@ const Symbol = union(enum) {
             .end => false,
             else => true,
         };
+    }
+
+    fn order(self: Symbol) u16 {
+        return switch (self) {
+            .end => unreachable,
+            .ascii => |i| @intCast(i),
+            .indx => |i| 0x7f + @intCast(i),
+        };
+    }
+
+    fn eql(self: Symbol, b: Symbol) bool {
+        return self.order() == b.order();
     }
 };
 
@@ -205,32 +219,120 @@ test "SymbolBuf Index" {
     try testing.expectEqual(Symbol.end, try rdr.next());
 }
 
+const SymbolPairHashCtx = struct {
+    const Self = @This();
+
+    pub fn hash(_: Self, key: [2]Symbol) u32 {
+        const k = (@as(u32, key[0].order()) << 16) + [1]key.order();
+
+        return std.hash.uint32(k);
+    }
+
+    pub fn eql(_: Self, a: [2]Symbol, b: [2]Symbol) bool {
+        return a[0].eql(b[0]) and a[1].eql(b[1]);
+    }
+};
+
+fn SymbolPairHashMap(comptime V: type) type {
+    return std.HashMap([2]Symbol, V, SymbolPairHashCtx, 80);
+}
+
 pub const BytePair = struct {
-    const dicLen = std.math.maxInt(u16) >> 1;
+    const tableLen = std.math.maxInt(u15);
 
-    dic: [dicLen]u16 = undefined,
+    enc: SymbolPairHashMap(Symbol) = undefined,
+    dec: [tableLen][2]Symbol = undefined,
+    maxIndx: u15 = 0,
 
-    pub fn init(corpus: []const u8) !BytePair {
-        const self = BytePair{};
-        _ = self;
-
+    pub fn init(alloc: Allocator, corpus: []const u8) !BytePair {
         for (corpus) |c| {
             if (!isAscii(c))
                 return BytePairError.NonAsciiInput;
         }
 
-        const bufs: [2 * corpus.len]u8 = undefined;
-        var syms = SymbolBuf.init(&corpus, &bufs);
-        var reader = syms.reader();
-        const freqMat = [_]([]u16){.{0} ** dicLen} ** dicLen;
-        _ = freqMat;
+        if (corpus.len > std.math.maxInt(u32))
+            return BytePairError.CorpusTooBig;
 
-        var s0 = rdr.next();
-        var s1 = rdr.next();
+        const self = BytePair{
+            .enc = SymbolPairHashMap(Symbol).init(alloc),
+        };
 
-        while (s1 != .end) : ({
-            s0 = rdr.next();
-            s1 = rdr.next();
-        }) {}
+        try self.enc.ensureTotalCapacity(tableLen);
+
+        const bufs = try alloc.alloc(u8, 2 * corpus.len);
+        defer alloc.free(bufs);
+        var syms = SymbolBuf.init(corpus, bufs);
+
+        var freq = SymbolPairHashMap(u32).init(alloc);
+        defer freq.deinit();
+        try freq.ensureTotalCapacity(@min(corpus.len, tableLen));
+
+        while (self.maxIndx < tableLen) {
+            var maxFreq: u32 = 0;
+            var mostFreq = .{Symbol{.end}} ** 2;
+
+            var read = syms.reader();
+            var s0 = read.next();
+            var s1 = read.next();
+
+            while (s1 != .end) : ({
+                s0 = s1;
+                s1 = read.next();
+            }) {
+                const f = try freq.getOrPut(.{ s0, s1 });
+
+                if (!f.found_existing)
+                    f.value_ptr.* = 0;
+
+                f.value_ptr.* += 1;
+                const fv = f.value_ptr.*;
+
+                if (maxFreq < fv) {
+                    maxFreq = fv;
+                    mostFreq[0] = s0;
+                    mostFreq[1] = s1;
+                }
+            }
+
+            if (maxFreq < 1)
+                break;
+
+            freq.clearRetainingCapacity();
+
+            self.dec[self.maxIndx][0] = s0;
+            self.dec[self.maxIndx][1] = s1;
+
+            const substSym = Symbol{ .indx = self.maxIndx };
+            const e = try self.enc.getOrPut(.{ mostFreq[0], mostFreq[1] });
+            std.debug.assert(!e.found_existing);
+            e.value_ptr.* = substSym;
+
+            self.maxIndx += 1;
+
+            read = syms.reader();
+            s0 = read.next();
+            s1 = read.next();
+
+            var write = syms.writer();
+
+            while (s1 != .end) : ({
+                s0 = s1;
+                s1 = read.next();
+            }) {
+                if (s0.eql(mostFreq[0]) and s1.eql(mostFreq[1])) {
+                    write.next(substSym);
+                } else {
+                    write.next(s0);
+                }
+            }
+
+            write.next(s0);
+            write.next(Symbol{.end});
+            syms.flip();
+        }
+
+        return self;
     }
 };
+
+test "BytePair" {}
