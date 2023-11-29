@@ -341,7 +341,7 @@ pub const BytePair = struct {
 
             const substSym = Symbol{ .indx = self.maxIndx };
             const e = try self.enc.getOrPut(.{ mostFreq[0], mostFreq[1] });
-            std.debug.print("\nmf {} {} {} {}\n", .{ maxFreq, mostFreq[0], mostFreq[1], substSym });
+            //std.debug.print("\nmf {} {} {} {}\n", .{ maxFreq, mostFreq[0], mostFreq[1], substSym });
             std.debug.assert(!e.found_existing);
             e.value_ptr.* = substSym;
 
@@ -356,7 +356,7 @@ pub const BytePair = struct {
 
             while (true) {
                 if (s0.eql(mostFreq[0]) and s1.eql(mostFreq[1])) {
-                    std.debug.print("subst {} {} -> {}\n", .{ s0, s1, substSym });
+                    //std.debug.print("subst {} {} -> {}\n", .{ s0, s1, substSym });
 
                     write.next(substSym);
 
@@ -374,6 +374,11 @@ pub const BytePair = struct {
                     s0 = s1;
                     s1 = try read.next();
                 }
+
+                if (s1 == .end) {
+                    write.next(s0);
+                    break;
+                }
             }
 
             write.rest(&read);
@@ -390,41 +395,83 @@ pub const BytePair = struct {
     }
 
     fn encodeAlloc(self: BytePair, in: []const u8) ![]u8 {
-        var buf = try self.alloc.alloc(u8, 2 * in.len);
+        const buf = try self.alloc.alloc(u8, 2 * in.len);
+        defer self.alloc.free(buf);
         var syms = SymbolBuf.init(in, buf);
 
         while (true) {
-            var subst: usize = 0;
+            var any: bool = false;
             var read = syms.reader();
-            var write = syms.writer();
             var s0 = try read.next();
             var s1 = try read.next();
+            var r: u15 = 0x7fff;
+            var last: usize = 0;
 
-            while (s1 != .end) {
+            while (s1 != .end) : ({
+                s0 = s1;
+                s1 = try read.next();
+            }) {
                 if (self.enc.get(.{ s0, s1 })) |sym| {
-                    std.debug.print("subst {} {} -> {}\n", .{ s0, s1, sym });
-                    s0 = sym;
+                    switch (sym) {
+                        .indx => |i| {
+                            any = true;
+
+                            if (i < r) {
+                                r = i;
+                                last = read.i;
+                            }
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+
+            if (!any)
+                break;
+
+            const rs = Symbol{ .indx = r };
+            const rs0 = self.dec[r][0];
+            const rs1 = self.dec[r][1];
+
+            var write = syms.writer();
+            read = syms.reader();
+
+            s0 = try read.next();
+            s1 = try read.next();
+
+            while (true) {
+                if (rs0.eql(s0) and rs1.eql(s1)) {
+                    //std.debug.print("subst {} {} -> {}\n", .{ s0, s1, rs });
+                    write.next(rs);
+
+                    if (read.i >= last)
+                        break;
+
+                    s0 = try read.next();
                     s1 = try read.next();
-                    subst += 1;
                 } else {
-                    std.debug.print("keep {}\n", .{s0});
+                    //std.debug.print("keep {}\n", .{s0});
 
                     write.next(s0);
 
                     s0 = s1;
                     s1 = try read.next();
                 }
+
+                if (s1 == .end) {
+                    write.next(s0);
+                    break;
+                }
             }
 
-            write.next(s0);
-
-            if (subst == 0) {
-                _ = self.alloc.resize(buf, write.i);
-                return buf[0..write.i];
-            }
+            write.rest(&read);
 
             syms.flip(write);
         }
+
+        const out = try self.alloc.alloc(u8, syms.len);
+        @memcpy(out, syms.getSide(syms.side));
+        return out;
     }
 
     fn decodeAlloc(self: BytePair, in: []const u8) ![]u8 {
@@ -498,8 +545,18 @@ test "BytePair sentences" {
 
     const decoded = try bp.decodeAlloc(encoded);
     defer testing.allocator.free(decoded);
-
     try testing.expectEqualStrings(alpha, decoded);
+
+    const alpha2 = "An unrelated sentence which maybe shares some sequences. We'll see how well it can be compressed.";
+
+    const encoded2 = try bp.encodeAlloc(alpha2);
+    defer testing.allocator.free(encoded2);
+
+    std.debug.print("\ncompression {} / {} = {}\n", .{ encoded2.len, alpha2.len, @as(f64, @floatFromInt(encoded2.len)) / @as(f64, @floatFromInt(alpha2.len)) });
+
+    const decoded2 = try bp.decodeAlloc(encoded2);
+    defer testing.allocator.free(decoded2);
+    try testing.expectEqualStrings(alpha2, decoded2);
 }
 
 test "BytePair ASCII" {
