@@ -4,6 +4,8 @@ const testing = std.testing;
 
 const BytePairError = error{
     NonAsciiInput,
+    NullByteInput,
+    UnrecognisedIndx,
     IndxTooBig,
     TruncatedSymbol,
     CorpusTooBig,
@@ -39,8 +41,10 @@ const Symbol = union(enum) {
         if (isAscii(b0))
             return .{ .ascii = @intCast(b0) };
 
-        if (bf.len < 2)
+        if (bf.len < 2) {
+            std.debug.print("truncated {}", .{b0});
             return BytePairError.TruncatedSymbol;
+        }
 
         const b1 = bf[1];
 
@@ -58,7 +62,7 @@ const Symbol = union(enum) {
         return switch (self) {
             .end => unreachable,
             .ascii => |i| @intCast(i),
-            .indx => |i| 0x7f + @intCast(i),
+            .indx => |i| 0x80 + @as(u16, @intCast(i)),
         };
     }
 
@@ -70,26 +74,23 @@ const Symbol = union(enum) {
 const SymbolBuf = struct {
     side: u1 = 0,
     buf: []u8,
+    len: usize,
 
-    pub fn init(corpus: []const u8, buf: []u8) SymbolBuf {
-        std.debug.assert(buf.len / 2 == corpus.len);
+    pub fn init(in: []const u8, buf: []u8) SymbolBuf {
+        std.debug.assert(buf.len / 2 == in.len);
 
-        @memcpy(buf[0..corpus.len], corpus);
+        @memcpy(buf[0..in.len], in);
 
         return SymbolBuf{
             .buf = buf,
+            .len = in.len,
         };
     }
 
-    fn len(self: SymbolBuf) usize {
-        return self.buf.len / 2;
-    }
-
     fn getSide(self: SymbolBuf, side: u1) []u8 {
-        const ln = self.len();
-        const s = side * ln;
+        const s = side * (self.buf.len / 2);
 
-        return self.buf[s..][0..ln];
+        return self.buf[s..][0..self.len];
     }
 
     fn reader(self: SymbolBuf) SymbolReader {
@@ -100,14 +101,15 @@ const SymbolBuf = struct {
         return SymbolWriter{ .buf = self.getSide(self.side ^ 1) };
     }
 
-    fn flip(self: *SymbolBuf) void {
+    fn flip(self: *SymbolBuf, written: SymbolWriter) void {
+        self.len = written.i;
         self.side ^= 1;
     }
 };
 
 const SymbolReader = struct {
     i: usize = 0,
-    buf: []u8,
+    buf: []const u8,
 
     fn next(self: *SymbolReader) BytePairError!Symbol {
         const ln = self.buf.len;
@@ -143,12 +145,12 @@ const SymbolWriter = struct {
                 self.i += 1;
             },
             .indx => |indx| {
-                buf[i] = @intCast(indx >> 7);
+                buf[i] = 0x80 + @as(u8, @intCast(indx >> 8));
                 buf[i + 1] = @truncate(indx);
 
                 self.i += 2;
             },
-            .end => unreachable,
+            .end => {},
         }
     }
 };
@@ -159,7 +161,7 @@ test "SymbolBuf ASCII" {
 
     var syms = SymbolBuf.init(corpus, &buf);
 
-    for (0..1) |_| {
+    for (0..2) |_| {
         var read = syms.reader();
 
         var s0 = try read.next();
@@ -177,6 +179,8 @@ test "SymbolBuf ASCII" {
             try testing.expectEqual(corpus[i + 1], s1.ascii);
         }
 
+        try testing.expectEqual(corpus.len - 1, i);
+
         read = syms.reader();
         var write = syms.writer();
 
@@ -186,60 +190,79 @@ test "SymbolBuf ASCII" {
             write.next(s0);
         }
 
-        syms.flip();
+        syms.flip(write);
     }
 }
 
 test "SymbolBuf Index" {
-    const corpus = [_]u8{ 'a', ' ', 0x80, 0x01, 0xff, 0xff };
+    const corpus = [_]u8{ 'a', ' ', 0x80, 0x00, 0xff, 0xff };
     var buf: [2 * corpus.len]u8 = undefined;
 
     var syms = SymbolBuf.init(&corpus, &buf);
-    var rdr = syms.reader();
 
-    var s0 = try rdr.next();
-    var s1 = try rdr.next();
+    for (0..2) |_| {
+        var rdr = syms.reader();
 
-    const Si = Symbol.init;
-    try testing.expectEqual(try Si('a'), s0);
-    try testing.expectEqual(try Si(' '), s1);
+        var s0 = try rdr.next();
+        var s1 = try rdr.next();
 
-    s0 = s1;
-    s1 = try rdr.next();
+        const Si = Symbol.init;
+        try testing.expectEqual(try Si('a'), s0);
+        try testing.expectEqual(try Si(' '), s1);
 
-    try testing.expectEqual(try Si(' '), s0);
-    try testing.expectEqual(try Si(0x8001), s1);
+        s0 = s1;
+        s1 = try rdr.next();
 
-    s0 = s1;
-    s1 = try rdr.next();
+        try testing.expectEqual(try Si(' '), s0);
+        try testing.expectEqual(try Si(0x8000), s1);
 
-    try testing.expectEqual(try Si(0x8001), s0);
-    try testing.expectEqual(try Si(0xffff), s1);
+        s0 = s1;
+        s1 = try rdr.next();
 
-    try testing.expectEqual(Symbol.end, try rdr.next());
+        try testing.expectEqual(try Si(0x8000), s0);
+        try testing.expectEqual(try Si(0xffff), s1);
+
+        try testing.expectEqual(Symbol.end, try rdr.next());
+
+        rdr = syms.reader();
+        var write = syms.writer();
+
+        s0 = try rdr.next();
+
+        while (s0.notEnd()) : (s0 = try rdr.next()) {
+            write.next(s0);
+        }
+
+        syms.flip(write);
+    }
 }
 
 const SymbolPairHashCtx = struct {
     const Self = @This();
 
-    pub fn hash(_: Self, key: [2]Symbol) u32 {
-        const k = (@as(u32, key[0].order()) << 16) + [1]key.order();
+    pub fn hash(self: Self, key: [2]Symbol) u32 {
+        _ = self;
+        const k = (@as(u32, key[0].order()) << 16) + key[1].order();
 
         return std.hash.uint32(k);
     }
 
-    pub fn eql(_: Self, a: [2]Symbol, b: [2]Symbol) bool {
+    pub fn eql(self: Self, a: [2]Symbol, b: [2]Symbol, b_index: usize) bool {
+        _ = self;
+        _ = b_index;
+
         return a[0].eql(b[0]) and a[1].eql(b[1]);
     }
 };
 
 fn SymbolPairHashMap(comptime V: type) type {
-    return std.HashMap([2]Symbol, V, SymbolPairHashCtx, 80);
+    return std.ArrayHashMap([2]Symbol, V, SymbolPairHashCtx, false);
 }
 
 pub const BytePair = struct {
     const tableLen = std.math.maxInt(u15);
 
+    alloc: Allocator,
     enc: SymbolPairHashMap(Symbol) = undefined,
     dec: [tableLen][2]Symbol = undefined,
     maxIndx: u15 = 0,
@@ -253,7 +276,8 @@ pub const BytePair = struct {
         if (corpus.len > std.math.maxInt(u32))
             return BytePairError.CorpusTooBig;
 
-        const self = BytePair{
+        var self = BytePair{
+            .alloc = alloc,
             .enc = SymbolPairHashMap(Symbol).init(alloc),
         };
 
@@ -264,20 +288,24 @@ pub const BytePair = struct {
         var syms = SymbolBuf.init(corpus, bufs);
 
         var freq = SymbolPairHashMap(u32).init(alloc);
-        defer freq.deinit();
+        defer {
+            freq.clearAndFree();
+            freq.deinit();
+        }
+
         try freq.ensureTotalCapacity(@min(corpus.len, tableLen));
 
         while (self.maxIndx < tableLen) {
             var maxFreq: u32 = 0;
-            var mostFreq = .{Symbol{.end}} ** 2;
+            var mostFreq = [_]Symbol{Symbol{ .end = {} }} ** 2;
 
             var read = syms.reader();
-            var s0 = read.next();
-            var s1 = read.next();
+            var s0 = try read.next();
+            var s1 = try read.next();
 
             while (s1 != .end) : ({
                 s0 = s1;
-                s1 = read.next();
+                s1 = try read.next();
             }) {
                 const f = try freq.getOrPut(.{ s0, s1 });
 
@@ -299,40 +327,176 @@ pub const BytePair = struct {
 
             freq.clearRetainingCapacity();
 
-            self.dec[self.maxIndx][0] = s0;
-            self.dec[self.maxIndx][1] = s1;
+            self.dec[self.maxIndx][0] = mostFreq[0];
+            self.dec[self.maxIndx][1] = mostFreq[1];
 
             const substSym = Symbol{ .indx = self.maxIndx };
             const e = try self.enc.getOrPut(.{ mostFreq[0], mostFreq[1] });
-            std.debug.assert(!e.found_existing);
+            //            std.debug.print("\nmf {} {} {} {}\n", .{ maxFreq, mostFreq[0], mostFreq[1], substSym });
+            //          std.debug.assert(!e.found_existing);
             e.value_ptr.* = substSym;
 
             self.maxIndx += 1;
 
             read = syms.reader();
-            s0 = read.next();
-            s1 = read.next();
+            s0 = try read.next();
+            s1 = try read.next();
 
             var write = syms.writer();
 
             while (s1 != .end) : ({
                 s0 = s1;
-                s1 = read.next();
+                s1 = try read.next();
             }) {
                 if (s0.eql(mostFreq[0]) and s1.eql(mostFreq[1])) {
                     write.next(substSym);
+
+                    //                std.debug.print("subst {} {} -> {}\n", .{ s0, s1, substSym });
+
+                    s0 = Symbol{ .end = {} };
+                    s1 = try read.next();
+                } else {
+                    write.next(s0);
+                    //              std.debug.print("keep {}\n", .{s0});
+                }
+            }
+
+            write.next(s0);
+            //    std.debug.print("keep {}\n", .{s0});
+
+            syms.flip(write);
+        }
+
+        return self;
+    }
+
+    fn deinit(self: *BytePair) void {
+        self.enc.clearAndFree();
+        self.enc.deinit();
+        self.maxIndx = 0;
+    }
+
+    fn encodeAlloc(self: BytePair, in: []const u8) ![]u8 {
+        var buf = try self.alloc.alloc(u8, 2 * in.len);
+        var syms = SymbolBuf.init(in, buf);
+
+        while (true) {
+            var subst: usize = 0;
+            var read = syms.reader();
+            var write = syms.writer();
+            var s0 = try read.next();
+            var s1 = try read.next();
+
+            while (s1 != .end) : ({
+                s0 = s1;
+                s1 = try read.next();
+            }) {
+                if (self.enc.get(.{ s0, s1 })) |sym| {
+                    write.next(sym);
+                    s1 = try read.next();
+                    subst += 1;
                 } else {
                     write.next(s0);
                 }
             }
 
             write.next(s0);
-            write.next(Symbol{.end});
-            syms.flip();
+
+            if (subst == 0) {
+                _ = self.alloc.resize(buf, write.i);
+                return buf[0..write.i];
+            }
+
+            syms.flip(write);
+        }
+    }
+
+    fn decodeAlloc(self: BytePair, in: []const u8) ![]u8 {
+        var stack = try std.ArrayList(Symbol).initCapacity(
+            self.alloc,
+            @max(1, std.math.log2(self.maxIndx)),
+        );
+        defer stack.deinit();
+        var out = try std.ArrayList(u8).initCapacity(self.alloc, 2 * in.len);
+        defer out.deinit();
+        var read = SymbolReader{ .buf = in };
+        var s = try read.next();
+
+        while (s != .end) {
+            switch (s) {
+                .end => unreachable,
+                .ascii => |c| {
+                    try out.append(c);
+
+                    //                    std.debug.print("add {}\n", .{c});
+
+                    s = if (stack.popOrNull()) |sym|
+                        sym
+                    else
+                        try read.next();
+                },
+                .indx => |i| {
+                    if (i > self.maxIndx)
+                        return BytePairError.UnrecognisedIndx;
+
+                    s = self.dec[i][0];
+
+                    try stack.append(self.dec[i][1]);
+
+                    //                  std.debug.print("i {} d {} p {}\n", .{ i, s, self.dec[i][1] });
+                },
+            }
         }
 
-        return self;
+        return try out.toOwnedSlice();
     }
 };
 
-test "BytePair" {}
+test "BytePair alpha" {
+    const alpha = "abcdefghijklmnopqrstuwxyz1";
+
+    var bp = try BytePair.init(testing.allocator, alpha);
+    defer bp.deinit();
+
+    const encoded = try bp.encodeAlloc(alpha);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(encoded.len, 2);
+    try testing.expectEqual(bp.maxIndx - 1, (@as(u15, @intCast(encoded[0])) << 8) + encoded[1]);
+
+    const decoded = try bp.decodeAlloc(encoded);
+    defer testing.allocator.free(decoded);
+
+    try testing.expectEqualStrings(alpha, decoded);
+}
+
+test "BytePair ASCII" {
+    const ascii = init: {
+        var arr: [2 * 128 * 128]u8 = undefined;
+
+        var k: usize = 0;
+
+        for (0..128) |i| {
+            for (0..128) |j| {
+                arr[k] = @intCast(i);
+                arr[k + 1] = @intCast(j);
+                k += 2;
+            }
+        }
+
+        if (k != arr.len) unreachable;
+
+        break :init arr;
+    };
+
+    var bp = try BytePair.init(testing.allocator, &ascii);
+    defer bp.deinit();
+    std.debug.print("Dictionary size {}", .{bp.maxIndx});
+
+    const encoded = try bp.encodeAlloc(&ascii);
+    defer testing.allocator.free(encoded);
+    std.debug.print("compression {} / {} = {}", .{ encoded.len, ascii.len, @as(f64, @floatFromInt(encoded.len)) / @as(f64, @floatFromInt(ascii.len)) });
+    const decoded = try bp.decodeAlloc(encoded);
+    defer testing.allocator.free(decoded);
+
+    try testing.expectEqualStrings(&ascii, decoded);
+}
