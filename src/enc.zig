@@ -153,6 +153,15 @@ const SymbolWriter = struct {
             .end => {},
         }
     }
+
+    fn rest(self: *SymbolWriter, reader: *SymbolReader) void {
+        const left = reader.buf.len - reader.i;
+
+        @memcpy(self.buf[self.i..][0..left], reader.buf[reader.i..]);
+
+        reader.i += left;
+        self.i += left;
+    }
 };
 
 test "SymbolBuf ASCII" {
@@ -332,8 +341,8 @@ pub const BytePair = struct {
 
             const substSym = Symbol{ .indx = self.maxIndx };
             const e = try self.enc.getOrPut(.{ mostFreq[0], mostFreq[1] });
-            //            std.debug.print("\nmf {} {} {} {}\n", .{ maxFreq, mostFreq[0], mostFreq[1], substSym });
-            //          std.debug.assert(!e.found_existing);
+            std.debug.print("\nmf {} {} {} {}\n", .{ maxFreq, mostFreq[0], mostFreq[1], substSym });
+            std.debug.assert(!e.found_existing);
             e.value_ptr.* = substSym;
 
             self.maxIndx += 1;
@@ -343,27 +352,31 @@ pub const BytePair = struct {
             s1 = try read.next();
 
             var write = syms.writer();
+            var subs: u32 = 0;
 
-            while (s1 != .end) : ({
-                s0 = s1;
-                s1 = try read.next();
-            }) {
+            while (true) {
                 if (s0.eql(mostFreq[0]) and s1.eql(mostFreq[1])) {
+                    std.debug.print("subst {} {} -> {}\n", .{ s0, s1, substSym });
+
                     write.next(substSym);
 
-                    //                std.debug.print("subst {} {} -> {}\n", .{ s0, s1, substSym });
+                    subs += 1;
+                    if (subs >= maxFreq)
+                        break;
 
-                    s0 = Symbol{ .end = {} };
+                    s0 = try read.next();
                     s1 = try read.next();
                 } else {
+                    //std.debug.print("keep {}\n", .{s0});
+
                     write.next(s0);
-                    //              std.debug.print("keep {}\n", .{s0});
+
+                    s0 = s1;
+                    s1 = try read.next();
                 }
             }
 
-            write.next(s0);
-            //    std.debug.print("keep {}\n", .{s0});
-
+            write.rest(&read);
             syms.flip(write);
         }
 
@@ -387,16 +400,19 @@ pub const BytePair = struct {
             var s0 = try read.next();
             var s1 = try read.next();
 
-            while (s1 != .end) : ({
-                s0 = s1;
-                s1 = try read.next();
-            }) {
+            while (s1 != .end) {
                 if (self.enc.get(.{ s0, s1 })) |sym| {
-                    write.next(sym);
+                    std.debug.print("subst {} {} -> {}\n", .{ s0, s1, sym });
+                    s0 = sym;
                     s1 = try read.next();
                     subst += 1;
                 } else {
+                    std.debug.print("keep {}\n", .{s0});
+
                     write.next(s0);
+
+                    s0 = s1;
+                    s1 = try read.next();
                 }
             }
 
@@ -428,7 +444,7 @@ pub const BytePair = struct {
                 .ascii => |c| {
                     try out.append(c);
 
-                    //                    std.debug.print("add {}\n", .{c});
+                    //std.debug.print("add {}\n", .{c});
 
                     s = if (stack.popOrNull()) |sym|
                         sym
@@ -443,7 +459,7 @@ pub const BytePair = struct {
 
                     try stack.append(self.dec[i][1]);
 
-                    //                  std.debug.print("i {} d {} p {}\n", .{ i, s, self.dec[i][1] });
+                    //std.debug.print("i {} d {} p {}\n", .{ i, s, self.dec[i][1] });
                 },
             }
         }
@@ -460,7 +476,24 @@ test "BytePair alpha" {
 
     const encoded = try bp.encodeAlloc(alpha);
     defer testing.allocator.free(encoded);
-    try testing.expectEqual(encoded.len, 2);
+    try testing.expectEqual(@as(usize, 2), encoded.len);
+    try testing.expectEqual(bp.maxIndx - 1, (@as(u15, @intCast(encoded[0])) << 8) + encoded[1]);
+
+    const decoded = try bp.decodeAlloc(encoded);
+    defer testing.allocator.free(decoded);
+
+    try testing.expectEqualStrings(alpha, decoded);
+}
+
+test "BytePair sentences" {
+    const alpha = "The quick brown fox jumped over the lazy white dog. The slow badger made a run for the hotel bar, but in the event was too late and went to be completely sober.";
+
+    var bp = try BytePair.init(testing.allocator, alpha);
+    defer bp.deinit();
+
+    const encoded = try bp.encodeAlloc(alpha);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(@as(usize, 2), encoded.len);
     try testing.expectEqual(bp.maxIndx - 1, (@as(u15, @intCast(encoded[0])) << 8) + encoded[1]);
 
     const decoded = try bp.decodeAlloc(encoded);
