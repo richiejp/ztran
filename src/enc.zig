@@ -15,6 +15,7 @@ fn isAscii(c: u8) bool {
     return c & 0x80 == 0;
 }
 
+/// Variable length symbol returned by the read and write iterators
 const Symbol = union(enum) {
     end: void,
     ascii: u7,
@@ -71,6 +72,7 @@ const Symbol = union(enum) {
     }
 };
 
+/// A double buffered symbol buffer
 const SymbolBuf = struct {
     side: u1 = 0,
     buf: []u8,
@@ -107,6 +109,7 @@ const SymbolBuf = struct {
     }
 };
 
+/// Iterate over symbols in a buffer
 const SymbolReader = struct {
     i: usize = 0,
     buf: []const u8,
@@ -130,6 +133,7 @@ const SymbolReader = struct {
     }
 };
 
+/// Write symbols to a buffer
 const SymbolWriter = struct {
     i: usize = 0,
     buf: []u8,
@@ -268,6 +272,7 @@ fn SymbolPairHashMap(comptime V: type) type {
     return std.ArrayHashMap([2]Symbol, V, SymbolPairHashCtx, false);
 }
 
+/// Byte pair encoding and decoding
 pub const BytePair = struct {
     const tableLen = std.math.maxInt(u15);
 
@@ -276,6 +281,8 @@ pub const BytePair = struct {
     dec: [tableLen][2]Symbol = undefined,
     maxIndx: u15 = 0,
 
+    /// Create a transcoder for the given corpus
+    /// If the corpus is very large then this is likely to be unbearably slow
     pub fn init(alloc: Allocator, corpus: []const u8) !BytePair {
         for (corpus) |c| {
             if (!isAscii(c))
@@ -394,6 +401,7 @@ pub const BytePair = struct {
         self.maxIndx = 0;
     }
 
+    /// Encode a slice of bytes allocating the output
     fn encodeAlloc(self: BytePair, in: []const u8) ![]u8 {
         const buf = try self.alloc.alloc(u8, 2 * in.len);
         defer self.alloc.free(buf);
@@ -474,6 +482,7 @@ pub const BytePair = struct {
         return out;
     }
 
+    /// Decode a slice of bytes allocating the output
     fn decodeAlloc(self: BytePair, in: []const u8) ![]u8 {
         var stack = try std.ArrayList(Symbol).initCapacity(
             self.alloc,
