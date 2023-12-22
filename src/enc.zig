@@ -583,7 +583,7 @@ test "BytePair sentences" {
     defer testing.allocator.free(decoded);
     try testing.expectEqualStrings(alpha, decoded);
 
-    const alpha2 = "An unrelated sentence which maybe shares some sequences. We'll see how well it can be compressed.";
+    const alpha2 = "An unrelated paragraph which shares some sequences. We'll see how well it can be compressed.. Will it be quick or slow, is the algorithm too lazy?";
 
     const encoded2 = try bp.encodeAlloc(alpha2);
     defer testing.allocator.free(encoded2);
