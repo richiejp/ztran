@@ -95,6 +95,10 @@ const SymbolBuf = struct {
         return self.buf[s..][0..self.len];
     }
 
+    fn getEncoded(self: SymbolBuf) []u8 {
+        return self.getSide(self.side);
+    }
+
     fn reader(self: SymbolBuf) SymbolReader {
         return SymbolReader{ .buf = self.getSide(self.side) };
     }
@@ -272,44 +276,54 @@ fn SymbolPairHashMap(comptime V: type) type {
     return std.ArrayHashMap([2]Symbol, V, SymbolPairHashCtx, false);
 }
 
-/// Byte pair encoding and decoding
+/// Byte pair transcoder
 pub const BytePair = struct {
     const tableLen = std.math.maxInt(u15);
 
     alloc: Allocator,
+    minFreq: u32,
+    freq: SymbolPairHashMap(u32),
     enc: SymbolPairHashMap(Symbol) = undefined,
     dec: [tableLen][2]Symbol = undefined,
     maxIndx: u15 = 0,
 
     /// Create a transcoder for the given corpus
     /// If the corpus is very large then this is likely to be unbearably slow
-    pub fn init(alloc: Allocator, corpus: []const u8) !BytePair {
+    pub fn init(alloc: Allocator, minFreq: u32) !BytePair {
+        var self = BytePair{
+            .alloc = alloc,
+            .minFreq = minFreq,
+            .freq = SymbolPairHashMap(u32).init(alloc),
+            .enc = SymbolPairHashMap(Symbol).init(alloc),
+        };
+
+        try self.enc.ensureTotalCapacity(tableLen);
+        try self.freq.ensureTotalCapacity(1024);
+
+        return self;
+    }
+
+    fn deinit(self: *BytePair) void {
+        self.enc.clearAndFree();
+        self.enc.deinit();
+        self.maxIndx = 0;
+        self.freq.clearAndFree();
+        self.freq.deinit();
+    }
+
+    fn addCorpus(self: *BytePair, corpus: []const u8) !void {
+        var buf: [2048]u8 = undefined;
+
+        if (corpus.len > buf.len / 2)
+            return BytePairError.CorpusTooBig;
+
         for (corpus) |c| {
             if (!isAscii(c))
                 return BytePairError.NonAsciiInput;
         }
 
-        if (corpus.len > std.math.maxInt(u32))
-            return BytePairError.CorpusTooBig;
-
-        var self = BytePair{
-            .alloc = alloc,
-            .enc = SymbolPairHashMap(Symbol).init(alloc),
-        };
-
-        try self.enc.ensureTotalCapacity(tableLen);
-
-        const bufs = try alloc.alloc(u8, 2 * corpus.len);
-        defer alloc.free(bufs);
-        var syms = SymbolBuf.init(corpus, bufs);
-
-        var freq = SymbolPairHashMap(u32).init(alloc);
-        defer {
-            freq.clearAndFree();
-            freq.deinit();
-        }
-
-        try freq.ensureTotalCapacity(@min(corpus.len, tableLen));
+        var syms = SymbolBuf.init(corpus, buf[0 .. 2 * corpus.len]);
+        _ = try self.encodeInplace(&syms);
 
         while (self.maxIndx < tableLen) {
             var maxFreq: u32 = 0;
@@ -323,7 +337,7 @@ pub const BytePair = struct {
                 s0 = s1;
                 s1 = try read.next();
             }) {
-                const f = try freq.getOrPut(.{ s0, s1 });
+                const f = try self.freq.getOrPut(.{ s0, s1 });
 
                 if (!f.found_existing)
                     f.value_ptr.* = 0;
@@ -338,10 +352,10 @@ pub const BytePair = struct {
                 }
             }
 
-            if (maxFreq < 1)
+            if (maxFreq < self.minFreq)
                 break;
 
-            freq.clearRetainingCapacity();
+            self.freq.clearRetainingCapacity();
 
             self.dec[self.maxIndx][0] = mostFreq[0];
             self.dec[self.maxIndx][1] = mostFreq[1];
@@ -391,22 +405,9 @@ pub const BytePair = struct {
             write.rest(&read);
             syms.flip(write);
         }
-
-        return self;
     }
 
-    fn deinit(self: *BytePair) void {
-        self.enc.clearAndFree();
-        self.enc.deinit();
-        self.maxIndx = 0;
-    }
-
-    /// Encode a slice of bytes allocating the output
-    fn encodeAlloc(self: BytePair, in: []const u8) ![]u8 {
-        const buf = try self.alloc.alloc(u8, 2 * in.len);
-        defer self.alloc.free(buf);
-        var syms = SymbolBuf.init(in, buf);
-
+    fn encodeInplace(self: BytePair, syms: *SymbolBuf) ![]u8 {
         while (true) {
             var any: bool = false;
             var read = syms.reader();
@@ -477,9 +478,31 @@ pub const BytePair = struct {
             syms.flip(write);
         }
 
-        const out = try self.alloc.alloc(u8, syms.len);
-        @memcpy(out, syms.getSide(syms.side));
-        return out;
+        return syms.getSide(syms.side);
+    }
+
+    /// Encode a slice of bytes allocating the output
+    fn encodeAlloc(self: BytePair, in: []const u8) ![]u8 {
+        const bsize = 1024;
+        var buf: [2 * bsize]u8 = undefined;
+        const out = try self.alloc.alloc(u8, in.len);
+
+        var i: usize = 0;
+        var o: usize = 0;
+        while (i + bsize <= in.len) : (i += bsize) {
+            var syms = SymbolBuf.init(in[i..][0..bsize], &buf);
+            const encoded = try self.encodeInplace(&syms);
+            @memcpy(out[o..][0..syms.len], encoded);
+            o += syms.len;
+        }
+        if (i < in.len) {
+            var syms = SymbolBuf.init(in[i..], buf[0 .. 2 * (in.len - i)]);
+            const encoded = try self.encodeInplace(&syms);
+            @memcpy(out[o..][0..syms.len], encoded);
+            o += syms.len;
+        }
+
+        return try self.alloc.realloc(out, o);
     }
 
     /// Decode a slice of bytes allocating the output
@@ -527,8 +550,10 @@ pub const BytePair = struct {
 test "BytePair alpha" {
     const alpha = "abcdefghijklmnopqrstuwxyz1";
 
-    var bp = try BytePair.init(testing.allocator, alpha);
+    var bp = try BytePair.init(testing.allocator, 1);
     defer bp.deinit();
+
+    try bp.addCorpus(alpha);
 
     const encoded = try bp.encodeAlloc(alpha);
     defer testing.allocator.free(encoded);
@@ -544,8 +569,10 @@ test "BytePair alpha" {
 test "BytePair sentences" {
     const alpha = "The quick brown fox jumped over the lazy white dog. The slow badger made a run for the hotel bar, but in the event was too late and went to be completely sober.";
 
-    var bp = try BytePair.init(testing.allocator, alpha);
+    var bp = try BytePair.init(testing.allocator, 1);
     defer bp.deinit();
+
+    try bp.addCorpus(alpha);
 
     const encoded = try bp.encodeAlloc(alpha);
     defer testing.allocator.free(encoded);
@@ -587,8 +614,15 @@ test "BytePair ASCII" {
         break :init arr;
     };
 
-    var bp = try BytePair.init(testing.allocator, &ascii);
+    var bp = try BytePair.init(testing.allocator, 2);
     defer bp.deinit();
+
+    var r: usize = 0;
+    while (r < ascii.len) : (r += 1024) {
+        const block = ascii[r .. r + 1024];
+
+        try bp.addCorpus(block);
+    }
     std.debug.print("Dictionary size {}", .{bp.maxIndx});
 
     const encoded = try bp.encodeAlloc(&ascii);
