@@ -588,8 +588,6 @@ test "BytePair sentences" {
     const encoded2 = try bp.encodeAlloc(alpha2);
     defer testing.allocator.free(encoded2);
 
-    std.debug.print("\ncompression {} / {} = {}\n", .{ encoded2.len, alpha2.len, @as(f64, @floatFromInt(encoded2.len)) / @as(f64, @floatFromInt(alpha2.len)) });
-
     const decoded2 = try bp.decodeAlloc(encoded2);
     defer testing.allocator.free(decoded2);
     try testing.expectEqualStrings(alpha2, decoded2);
@@ -623,11 +621,10 @@ test "BytePair ASCII" {
 
         try bp.addCorpus(block);
     }
-    std.debug.print("Dictionary size {}", .{bp.maxIndx});
 
     const encoded = try bp.encodeAlloc(&ascii);
     defer testing.allocator.free(encoded);
-    std.debug.print("compression {} / {} = {}", .{ encoded.len, ascii.len, @as(f64, @floatFromInt(encoded.len)) / @as(f64, @floatFromInt(ascii.len)) });
+
     const decoded = try bp.decodeAlloc(encoded);
     defer testing.allocator.free(decoded);
 
